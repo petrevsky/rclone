@@ -348,6 +348,17 @@ type linkboxChunkWriter struct {
 }
 
 func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
+
+	fs.Debugf(f, "Fs.OpenChunkWriter: Called for %s", remote)
+    fs.Debugf(f, "Fs.OpenChunkWriter: Received options (len %d):", len(options))
+    for i, opt := range options {
+        fs.Debugf(f, "Fs.OpenChunkWriter: Option %d: Type=%T, Value=%+v", i, opt, opt)
+        if _, ok := opt.(RcloneLinkboxUploadInfoOption); ok {
+            fs.Debugf(f, "Fs.OpenChunkWriter: Found RcloneLinkboxUploadInfoOption at index %d in OpenChunkWriter", i)
+        }
+    }
+    // END OF DEBUG LINES
+
 	var uploadOptPayload RcloneLinkboxUploadInfoOption; foundOpt := false
 	for _, option := range options { if opt, ok := option.(RcloneLinkboxUploadInfoOption); ok { uploadOptPayload = opt; foundOpt = true; break } }
 	if !foundOpt { return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: RcloneLinkboxUploadInfoOption not found") }
