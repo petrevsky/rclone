@@ -283,6 +283,17 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	fs.Debugf(o, "Using multipart OBS upload for %s (size %s >= cutoff %s)", o.Remote(), fs.SizeSuffix(size), f.opt.UploadCutoff)
 	uploadOpt := RcloneLinkboxUploadInfoOption{ MD5ofPre10M: md5Pre10M, S3Auth: s3Auth, ObjectToUpdate: o }
 	finalOpts := append(options, uploadOpt)
+
+	fs.Debugf(o, "Object.Update: About to call UploadMultipart for %s", src.Remote())
+	fs.Debugf(o, "Object.Update: Original 'options' len %d, finalOpts len %d", len(options), len(finalOpts))
+	fs.Debugf(o, "Object.Update: finalOpts being passed:")
+	for i, optFromSlice := range finalOpts { // Renamed 'opt' to 'optFromSlice' to avoid conflict if 'opt' is defined in outer scope
+		fs.Debugf(o, "Object.Update: finalOpts[%d]: Type=%T, Value=%+v", i, optFromSlice, optFromSlice)
+		if _, ok := optFromSlice.(RcloneLinkboxUploadInfoOption); ok {
+			fs.Debugf(o, "Object.Update: Found RcloneLinkboxUploadInfoOption at finalOpts[%d]", i)
+		}
+	}
+
 	// obsClient created above will be passed to OpenChunkWriter via the option if we modify how options are handled,
 	// or OpenChunkWriter creates its own. Current design: OpenChunkWriter creates its own.
 	// The obsClient created here is not used further if multipart.
