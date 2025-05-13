@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/huaweicloud/huaweicloud-sdk-go-obs/obs" // Ensure this is the correct import path
+	"github.com/huaweicloud/huaweicloud-sdk-go-obs/obs" 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
@@ -49,7 +50,7 @@ func init() { /* ... same ... */
 	fs.Register(fsi)
 }
 type Options struct { Token string `config:"token"`; UploadCutoff fs.SizeSuffix `config:"upload_cutoff"`; ChunkSize fs.SizeSuffix `config:"chunk_size"`; UploadConcurrency int `config:"upload_concurrency"`}
-type Fs struct { name string; root string; opt Options; features *fs.Features; ci *fs.ConfigInfo; srv *rest.Client; dirCache *dircache.DirCache; pacer *fs.Pacer } // s3Srv removed
+type Fs struct { name string; root string; opt Options; features *fs.Features; ci *fs.ConfigInfo; srv *rest.Client; dirCache *dircache.DirCache; pacer *fs.Pacer }
 type Object struct { fs *Fs; remote string; size int64; modTime time.Time; contentType string; fullURL string; dirID int64; itemID string; id int64; isDir bool }
 
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) { /* ... same ... */
@@ -86,37 +87,29 @@ func (r *response) Error() string { return fmt.Sprintf("Linkbox API error %d: %s
 type responser interface { IsError() bool; Error() string }
 type FileUploadSessionData struct { AK string `json:"ak"`; Bucket string `json:"bucket"`; PoolPath string `json:"poolPath"`; SToken string `json:"sToken"`; Server string `json:"server"`; SK string `json:"sk"`; TS int64  `json:"ts"`}
 type FileUploadSessionResponse struct { Data *FileUploadSessionData `json:"data"`; Status int `json:"status"`; Message string `json:"msg,omitempty"`}
-func (r *FileUploadSessionResponse) IsError() bool { if r.Status == 1 { if r.Data != nil && r.Data.AK != "" && r.Data.Server != "" && r.Data.Bucket != "" && r.Data.PoolPath != "" { return false }; return true }; return true }
+func (r *FileUploadSessionResponse) IsError() bool { if r.Status == 1 { if r.Data != nil && r.Data.AK != "" && r.Data.Server != "" && r.Data.Bucket != "" && r.Data.PoolPath != "" { return false }; return true }; if r.Status == 600 { return false }; return true }
 func (r *FileUploadSessionResponse) Error() string { if r.Status == 1 && (r.Data == nil || r.Data.AK == "") { return fmt.Sprintf("Telebox API success status (1) but S3 auth data is missing/incomplete. Message: '%s'", r.Message) }; return fmt.Sprintf("Telebox API error (Status: %d, Message: '%s')", r.Status, r.Message) }
 func (r *FileUploadSessionResponse) GetS3AuthData() FileUploadSessionData { if r.Data != nil { return *r.Data }; return FileUploadSessionData{} }
 
-func getS3Endpoint(s3Auth FileUploadSessionData) (string, error) { /* ... same as before ... */
+func getS3Endpoint(s3Auth FileUploadSessionData) (string, error) { /* ... same ... */
 	if s3Auth.Server == "" || s3Auth.Bucket == "" { return "", fmt.Errorf("missing server or bucket for S3 endpoint") }
 	parsedServerURL, err := url.Parse(s3Auth.Server); if err != nil { return "", fmt.Errorf("parse S3 server URL '%s': %w", s3Auth.Server, err) }
-	return parsedServerURL.Scheme + "://" + parsedServerURL.Host, nil
+	s3Host := s3Auth.Bucket + "." + parsedServerURL.Host; return parsedServerURL.Scheme + "://" + s3Host, nil
 }
-
-func newObsClientFromAuthData(authData FileUploadSessionData, constructedEndpoint string) (*obs.ObsClient, error) {
-	if constructedEndpoint == "" || authData.AK == "" || authData.SK == "" {
-		return nil, fmt.Errorf("incomplete credentials/endpoint for OBS client (endpoint, AK, or SK missing)")
-	}
-	var obsClient *obs.ObsClient
-	var err error
-	if authData.SToken != "" {
-		obsClient, err = obs.New(authData.AK, authData.SK, constructedEndpoint, obs.WithSecurityToken(authData.SToken))
-	} else {
-		obsClient, err = obs.New(authData.AK, authData.SK, constructedEndpoint)
-	}
+func newObsClientFromAuthData(authData FileUploadSessionData, constructedEndpoint string) (*obs.ObsClient, error) { /* ... same ... */
+	if constructedEndpoint == "" || authData.AK == "" || authData.SK == "" { return nil, fmt.Errorf("incomplete credentials/endpoint for OBS client (endpoint, AK, or SK missing)") }
+	var obsClient *obs.ObsClient; var err error
+	if authData.SToken != "" { obsClient, err = obs.New(authData.AK, authData.SK, constructedEndpoint, obs.WithSecurityToken(authData.SToken))
+	} else { obsClient, err = obs.New(authData.AK, authData.SK, constructedEndpoint) }
 	if err != nil { return nil, fmt.Errorf("failed to initialize OBS client with endpoint '%s': %w", constructedEndpoint, err) }
-	fs.Debugf(nil, "OBS Client initialized for endpoint: %s", constructedEndpoint)
-	return obsClient, nil
+	fs.Debugf(nil, "OBS Client initialized for endpoint: %s", constructedEndpoint); return obsClient, nil
 }
 
 func (o *Object) set(e *entity) { /* ... */ o.modTime = time.Unix(e.Ctime, 0); o.contentType = e.Type; o.size = e.Size; o.fullURL = e.URL; o.isDir = e.isDir(); o.id = e.ID; o.itemID = e.ItemID; o.dirID = e.Pid }
 func getUnmarshaledTeleboxAPIResponse(ctx context.Context, f *Fs, opts *rest.Opts, result *FileUploadSessionResponse) error { /* ... */ 
 	err := f.pacer.Call(func() (bool, error) {
 		resp, httpErr := f.srv.CallJSON(ctx, opts, nil, result)
-		if httpErr == nil { if result.IsError() { fs.Debugf(f, "Telebox API error: Status: %d, Msg: '%s', Data: %+v", result.Status, result.Message, result.Data); return false, result }}
+		if httpErr == nil { if result.IsError() { fs.Debugf(f, "Telebox API indicated error: Status: %d, Msg: '%s', Data: %+v", result.Status, result.Message, result.Data); return false, result }}
 		return f.shouldRetry(ctx, resp, httpErr)
 	}); if err != nil { return err }; if result.IsError() { return result }; return nil
 }
@@ -188,11 +181,15 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	err := o.fs.pacer.Call(func() (bool, error) { var e error; res, e = o.fs.srv.Call(ctx, opts); return o.fs.shouldRetry(ctx, res, e) })
 	if err != nil { return nil, fmt.Errorf("Open failed: %w", err) }; return res.Body, nil
 }
-func (f *Fs) readFirst10MBAndPrepReader(ctx context.Context, in io.Reader, size int64) ([]byte, string, io.Reader, error) { /* ... */ 
+func (f *Fs) readFirst10MBAndPrepReader(ctx context.Context, in io.Reader, size int64) ([]byte, string, io.Reader, error) { 
 	limit := int64(10 * 1024 * 1024); if size >= 0 && size < limit { limit = size }
-	b := make([]byte, int(limit)); n, readErr := io.ReadFull(in, b)
-	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF { return nil, "", nil, fmt.Errorf("failed to read first 10MB: %w", readErr) }
-	b = b[:n]; h := md5.Sum(b); md5sum := fmt.Sprintf("%x", h); return b, md5sum, io.MultiReader(bytes.NewReader(b), in), nil
+	first10mBytesRead := make([]byte, int(limit))
+	n, readErr := io.ReadFull(in, first10mBytesRead)
+	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		return nil, "", nil, fmt.Errorf("failed to read first 10MB: %w", readErr)
+	}
+	first10mBytesRead = first10mBytesRead[:n]; h := md5.Sum(first10mBytesRead); md5sum := fmt.Sprintf("%x", h)
+	return first10mBytesRead, md5sum, io.MultiReader(bytes.NewReader(first10mBytesRead), in), nil
 }
 func (o *Object) completeUploadLinkbox(ctx context.Context, md5OfFirst10M string, size int64, remote string, options ...fs.OpenOption) error { /* ... */ 
 	leaf, dirID, err := o.fs.dirCache.FindPath(ctx, remote, true); if err != nil { return fmt.Errorf("completeUploadLinkbox: FindPath failed: %w", err) }
@@ -210,10 +207,19 @@ func (o *Object) completeUploadLinkbox(ctx context.Context, md5OfFirst10M string
 	o.set(entity); return nil
 }
 
-type RcloneLinkboxUploadInfoOption struct { MD5ofPre10M string; S3Auth FileUploadSessionData; ObjectToUpdate *Object }
+// RcloneLinkboxUploadInfoOption is used to pass S3 auth data (and the object being updated)
+// from Object.Update to Fs.OpenChunkWriter if Object.Update calls multipart.UploadMultipart.
+// This is necessary because OpenChunkWriter might also be called directly by rclone core
+// (e.g., for streaming uploads) in which case it needs to fetch this data itself.
+type RcloneLinkboxUploadInfoOption struct {
+	S3Auth         FileUploadSessionData // Carries AK, SK, SToken, Bucket, PoolPath, Server
+	MD5ofPre10M    string                // Needed by linkboxChunkWriter for the final completeUploadLinkbox call
+	ObjectToUpdate *Object               // The Fs.Object instance that is being updated
+}
 func (opt RcloneLinkboxUploadInfoOption) String() string { return "LinkboxUploadInfoOption" }
 func (opt RcloneLinkboxUploadInfoOption) Header() (string, string) { return "", "" }
 func (opt RcloneLinkboxUploadInfoOption) Mandatory() bool { return false }
+
 
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
 	f := o.fs; size := src.Size()
@@ -229,78 +235,74 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if errRead != nil { return fmt.Errorf("Update: readFirst10MB: %w", errRead) }
 
 	vgroup := fmt.Sprintf("%s_%d", md5Pre10M, size)
-	fs.Debugf(o, "Requesting upload session, vgroup: %s", vgroup)
+	fs.Debugf(o, "Update: Requesting upload session for %s, vgroup: %s", o.Remote(), vgroup)
 	sessionOpts := &rest.Opts{ Method:  "GET", RootURL: teleboxAPIURL, Path: "file/get_file_upload_session", Parameters: url.Values{ "scene": {"common"}, "vgroupType": {"md5_10m"}, "vgroup": {vgroup}, "token": {f.opt.Token}, "platform": {"web"}, "pf": {"web"}, "lan": {"en"}, } }
 	var sessionResp FileUploadSessionResponse
 	errSession := getUnmarshaledTeleboxAPIResponse(ctx, f, sessionOpts, &sessionResp)
 
-	if sessionResp.Status == 600 && strings.Contains(strings.ToLower(sessionResp.Message), "not need upload") {
-		fs.Debugf(o, "Telebox API status 600 (msg: '%s'): File content likely exists in cloud storage. Skipping S3 upload, proceeding to finalize.", sessionResp.Message)
+	if sessionResp.Status == 600 {
+		fs.Debugf(o, "Update: Telebox API status 600 (msg: '%s') for %s: File content likely exists. Skipping S3 upload.", sessionResp.Message, o.Remote())
 		return o.completeUploadLinkbox(ctx, md5Pre10M, size, src.Remote(), options...)
 	}
-
-	if errSession != nil { return fmt.Errorf("Update: get_file_upload_session: %w", errSession) }
+	if errSession != nil { return fmt.Errorf("Update: get_file_upload_session for %s: %w", o.Remote(), errSession) }
 	
 	s3Auth := sessionResp.GetS3AuthData()
-	fs.Debugf(o, "S3AuthData from GetS3AuthData(): %+v", s3Auth)
+	fs.Debugf(o, "Update: S3AuthData for %s: %+v", o.Remote(), s3Auth)
 	if s3Auth.Server == "" || s3Auth.Bucket == "" || s3Auth.PoolPath == "" || s3Auth.AK == "" {
-		return fmt.Errorf("Update: incomplete S3 auth data. Server: '%s', Bucket: '%s', Path: '%s', AK: '%s...'", s3Auth.Server, s3Auth.Bucket, s3Auth.PoolPath, string([]rune(s3Auth.AK)[:min(3, len(s3Auth.AK))]))
+		return fmt.Errorf("Update: incomplete S3 auth data for %s. Server: '%s', Bucket: '%s', Path: '%s', AK: '%s...'", o.Remote(), s3Auth.Server, s3Auth.Bucket, s3Auth.PoolPath, string([]rune(s3Auth.AK)[:min(3, len(s3Auth.AK))]))
 	}
-	fs.Debugf(o, "S3 session: Server: %s, Bucket: %s, Key: %s", s3Auth.Server, s3Auth.Bucket, s3Auth.PoolPath)
-
+	
 	s3Endpoint, errEndpoint := getS3Endpoint(s3Auth)
-	if errEndpoint != nil { return fmt.Errorf("Update: getS3Endpoint: %w", errEndpoint) }
-	fs.Debugf(o, "Constructed S3 Endpoint: %s", s3Endpoint)
+	if errEndpoint != nil { return fmt.Errorf("Update: getS3Endpoint for %s: %w", o.Remote(), errEndpoint) }
 	s3ObjectKey := strings.TrimLeft(s3Auth.PoolPath, "/")
 
 	obsClient, errSdk := newObsClientFromAuthData(s3Auth, s3Endpoint)
-	if errSdk != nil { return fmt.Errorf("Update: failed to init OBS client: %w", errSdk) }
-	// Client is closed either at the end of this function (for single part) or by chunkWriter
-
+	if errSdk != nil { return fmt.Errorf("Update: failed to init OBS client for %s: %w", o.Remote(), errSdk) }
+	
 	if size < int64(f.opt.UploadCutoff) {
 		fs.Debugf(o, "Using single part OBS PUT for %s (size %s < cutoff %s)", o.Remote(), fs.SizeSuffix(size), f.opt.UploadCutoff)
-		defer obsClient.Close() // Close client after single operation
-
+		defer obsClient.Close() 
 		putInput := &obs.PutObjectInput{}
 		putInput.Bucket = s3Auth.Bucket
 		putInput.Key = s3ObjectKey
 		putInput.Body = streamReader 
-		// Set ContentLength if SDK requires it explicitly for io.Reader body,
-		// otherwise, SDK usually infers or doesn't need it if it can stream.
-		// From obs/client_object.go, PutObjectInput.Body is io.Reader.
-		// The internal doAction calls prepareData which sets ContentLength header if data is string/[]byte.
-		// For io.Reader, it relies on HTTP client to set it or uses chunked encoding.
-		// However, OBS examples for PutObject with Body often also set ContentLength on the input struct if known.
-		putInput.ContentLength = size // Set it explicitly
-
-		fs.Debugf(o, "OBS PutObject: Bucket: %s, Key: %s, Size: %d", putInput.Bucket, putInput.Key, putInput.ContentLength)
+		putInput.ContentLength = size // This field IS present on obs.PutObjectInput according to SDK examples
+		fs.Debugf(o, "OBS PutObject for %s: Bucket: %s, Key: %s, Size: %d", o.Remote(), putInput.Bucket, putInput.Key, putInput.ContentLength)
 		_, errPut := obsClient.PutObject(putInput) 
-		if errPut != nil { return fmt.Errorf("single part OBS PUT failed for %s: %w", o.Remote(), errPut) }
-		
+		if errPut != nil { return fmt.Errorf("single part OBS PUT for %s failed: %w", o.Remote(), errPut) }
 		return o.completeUploadLinkbox(ctx, md5Pre10M, size, src.Remote(), options...)
 	}
 
 	fs.Debugf(o, "Using multipart OBS upload for %s (size %s >= cutoff %s)", o.Remote(), fs.SizeSuffix(size), f.opt.UploadCutoff)
-	uploadOpt := RcloneLinkboxUploadInfoOption{ MD5ofPre10M: md5Pre10M, S3Auth: s3Auth, ObjectToUpdate: o }
-	finalOpts := append(options, uploadOpt)
+	obsClient.Close() // Close client from single-part path, multipart will manage its own.
+
+	// Prepare the backend-specific option for OpenChunkWriter
+	// This is crucial for when Update -> multipart.UploadMultipart -> OpenChunkWriter is the path.
+	linkboxOpt := RcloneLinkboxUploadInfoOption{ 
+		S3Auth:         s3Auth,
+		MD5ofPre10M:    md5Pre10M, 
+		ObjectToUpdate: o, // Pass the current object instance
+	}
+	// Prepend our specific option to any options passed down from the caller (e.g. operations layer)
+	// Making it the first element can sometimes help in debugging if options are truncated.
+	// Or, create a new slice if original `options` are not meant to be mixed.
+	// The important part is that linkboxOpt is in the slice passed to UploadMultipart.
+	finalMultipartOptions := make([]fs.OpenOption, 0, len(options)+1)
+	finalMultipartOptions = append(finalMultipartOptions, linkboxOpt)
+	finalMultipartOptions = append(finalMultipartOptions, options...)
+
 
 	fs.Debugf(o, "Object.Update: About to call UploadMultipart for %s", src.Remote())
-	fs.Debugf(o, "Object.Update: Original 'options' len %d, finalOpts len %d", len(options), len(finalOpts))
-	fs.Debugf(o, "Object.Update: finalOpts being passed:")
-	for i, optFromSlice := range finalOpts { // Renamed 'opt' to 'optFromSlice' to avoid conflict if 'opt' is defined in outer scope
-		fs.Debugf(o, "Object.Update: finalOpts[%d]: Type=%T, Value=%+v", i, optFromSlice, optFromSlice)
-		if _, ok := optFromSlice.(RcloneLinkboxUploadInfoOption); ok {
-			fs.Debugf(o, "Object.Update: Found RcloneLinkboxUploadInfoOption at finalOpts[%d]", i)
-		}
+	fs.Debugf(o, "Object.Update: finalMultipartOptions being passed (len %d):", len(finalMultipartOptions))
+	for i, optFromSlice := range finalMultipartOptions {
+	    fs.Debugf(o, "Object.Update: finalMultipartOptions[%d]: Type=%T, Value=%+v", i, optFromSlice, optFromSlice)
+	    if _, ok := optFromSlice.(RcloneLinkboxUploadInfoOption); ok {
+	        fs.Debugf(o, "Object.Update: Found RcloneLinkboxUploadInfoOption at finalMultipartOptions[%d]", i)
+	    }
 	}
-
-	// obsClient created above will be passed to OpenChunkWriter via the option if we modify how options are handled,
-	// or OpenChunkWriter creates its own. Current design: OpenChunkWriter creates its own.
-	// The obsClient created here is not used further if multipart.
-	obsClient.Close() // Close the client if we are going into multipart (which will make its own)
-
-	_, errMulti := multipart.UploadMultipart(ctx, src, streamReader, multipart.UploadMultipartOptions{ Open: f, OpenOptions: finalOpts })
-	if errMulti != nil { return fmt.Errorf("multipart.UploadMultipart failed for %s: %w", o.Remote(), errMulti) }
+	
+	_, errMulti := multipart.UploadMultipart(ctx, src, streamReader, multipart.UploadMultipartOptions{ Open: f, OpenOptions: finalMultipartOptions })
+	if errMulti != nil { return fmt.Errorf("multipart.UploadMultipart for %s failed: %w", o.Remote(), errMulti) }
 	return nil
 }
 
@@ -325,7 +327,9 @@ func (f *Fs) Hashes() hash.Set         { return hash.Set(hash.None) }
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) { /* ... */ 
 	o := &Object{fs: f, remote: src.Remote(), size: src.Size()}
 	dir, _ := dircache.SplitPath(src.Remote()); if dir != "" { err := f.Mkdir(ctx, dir); if err != nil { return nil, fmt.Errorf("Put: Mkdir %q: %w", dir, err) } }
-	err := o.Update(ctx, in, src, options...); return o, err
+	// Pass the options from Put to Update
+	err := o.Update(ctx, in, src, options...)
+	return o, err
 }
 func (f *Fs) Purge(ctx context.Context, dir string) error   { return f.purgeCheck(ctx, dir, false) }
 func (f *Fs) DirCacheFlush()                                { f.dirCache.ResetRoot() }
@@ -334,121 +338,116 @@ func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (b
 	if fserrors.ContextError(ctx, &err) { return false, err }; return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
-// --- S3 Multipart Upload Implementation (using OBS SDK) ---
+// S3 XML Structs (unchanged)
+type InitiateMultipartUploadResult struct { XMLName xml.Name `xml:"InitiateMultipartUploadResult"`; Bucket string `xml:"Bucket"`; Key string `xml:"Key"`; UploadID string `xml:"UploadId"`}
 // S3Error might not be needed if SDK provides its own error types.
-// type S3Error struct { XMLName xml.Name `xml:"Error"`; Code string `xml:"Code"`; Message string `xml:"Message"`; RequestID string `xml:"RequestId"`; HostID string `xml:"HostId"`}
-// func (e *S3Error) Error() string { return fmt.Sprintf("s3 server error: Code: %s, Message: %s, RequestId: %s, HostId: %s", e.Code, e.Message, e.RequestID, e.HostID)}
 
 type linkboxChunkWriter struct {
 	f             *Fs; o *Object; srcRemote     string
 	s3Auth        FileUploadSessionData; obsClient *obs.ObsClient 
 	s3ObjectKey   string; s3UploadID    string
 	parts         []obs.Part; mu sync.Mutex 
-	md5OfFirst10M string; fileSize int64
+	md5OfFirst10M string; fileSize int64 
 }
 
 func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
-
-	fs.Debugf(f, "Fs.OpenChunkWriter: Called for %s", remote)
-    fs.Debugf(f, "Fs.OpenChunkWriter: Received options (len %d):", len(options))
-    for i, opt := range options {
+	fs.Debugf(f, "Fs.OpenChunkWriter: Called for %s. Received options (len %d):", remote, len(options))
+    for i, opt := range options { 
         fs.Debugf(f, "Fs.OpenChunkWriter: Option %d: Type=%T, Value=%+v", i, opt, opt)
         if _, ok := opt.(RcloneLinkboxUploadInfoOption); ok {
             fs.Debugf(f, "Fs.OpenChunkWriter: Found RcloneLinkboxUploadInfoOption at index %d in OpenChunkWriter", i)
         }
     }
-    // END OF DEBUG LINES
 
-	var uploadOptPayload RcloneLinkboxUploadInfoOption; foundOpt := false
-	for _, option := range options { if opt, ok := option.(RcloneLinkboxUploadInfoOption); ok { uploadOptPayload = opt; foundOpt = true; break } }
-	if !foundOpt { return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: RcloneLinkboxUploadInfoOption not found") }
-	s3Auth := uploadOptPayload.S3Auth
-	if s3Auth.Server == "" || s3Auth.Bucket == "" || s3Auth.PoolPath == "" { return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: Incomplete S3 auth data") }
+	var s3Auth FileUploadSessionData
+	var md5Pre10M string
+	var objectToUpdate *Object
+	foundCustomOpt := false
+
+	for _, option := range options {
+		if opt, ok := option.(RcloneLinkboxUploadInfoOption); ok {
+			s3Auth = opt.S3Auth
+			md5Pre10M = opt.MD5ofPre10M
+			objectToUpdate = opt.ObjectToUpdate
+			foundCustomOpt = true
+			fs.Debugf(f, "OpenChunkWriter: Successfully extracted RcloneLinkboxUploadInfoOption for %s", remote)
+			break
+		}
+	}
+
+	if !foundCustomOpt {
+		// This path is taken if rclone core calls OpenChunkWriter directly (e.g. streaming upload)
+		// We MUST fetch credentials here.
+		fs.Debugf(f, "OpenChunkWriter: RcloneLinkboxUploadInfoOption not found for %s. Fetching S3 session info.", remote)
+		
+		// Need to open the source to read its first 10MB for md5
+		// This is problematic as fs.ObjectInfo doesn't guarantee Open()
+		// This indicates a design issue if OpenChunkWriter can be called without pre-fetched S3Auth
+		// for a backend that requires dynamic, content-based credentials.
+		// For now, we will rely on the option being passed. If it's not, this will fail.
+		// This path (direct call by rclone core) seems to be the one causing the issue.
+		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: RcloneLinkboxUploadInfoOption not found for %s - backend requires pre-fetched S3 credentials via this option", remote)
+	}
+
+	if s3Auth.Server == "" || s3Auth.Bucket == "" || s3Auth.PoolPath == "" {
+		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: Incomplete S3 auth data in option for %s", remote)
+	}
+	if objectToUpdate == nil {
+		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: ObjectToUpdate not found in RcloneLinkboxUploadInfoOption for %s", remote)
+	}
+
 
 	s3Endpoint, err := getS3Endpoint(s3Auth)
-	if err != nil { return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: getS3Endpoint: %w", err) }
+	if err != nil { return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: getS3Endpoint for %s: %w", remote, err) }
 	s3ObjectKey := strings.TrimLeft(s3Auth.PoolPath, "/")
 
 	obsClient, err := newObsClientFromAuthData(s3Auth, s3Endpoint)
-	if err != nil { return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: newObsClientFromAuthData: %w", err) }
+	if err != nil { return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: newObsClientFromAuthData for %s: %w", remote, err) }
 
 	initiateInput := &obs.InitiateMultipartUploadInput{}; initiateInput.Bucket = s3Auth.Bucket; initiateInput.Key = s3ObjectKey
-	fs.Debugf(f, "OBS InitiateMultipartUpload: Bucket: %s, Key: %s", initiateInput.Bucket, initiateInput.Key)
+	fs.Debugf(f, "OBS InitiateMultipartUpload for %s: Bucket: %s, Key: %s", remote, initiateInput.Bucket, initiateInput.Key)
 	initiateOutput, err := obsClient.InitiateMultipartUpload(initiateInput)
-	if err != nil { obsClient.Close(); return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: OBS InitiateMultipartUpload failed: %w", err) }
-	if initiateOutput.UploadId == "" { obsClient.Close(); return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: OBS InitiateMultipartUpload did not return UploadId") }
-
+	if err != nil { obsClient.Close(); return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: OBS InitiateMultipartUpload for %s failed: %w", remote, err) }
+	if initiateOutput.UploadId == "" { obsClient.Close(); return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: OBS InitiateMultipartUpload for %s did not return UploadId", remote) }
+	
 	writer := &linkboxChunkWriter{
-		f: f, o: uploadOptPayload.ObjectToUpdate, srcRemote: remote, s3Auth: s3Auth, obsClient: obsClient,
+		f: f, o: objectToUpdate, srcRemote: remote, s3Auth: s3Auth, obsClient: obsClient,
 		s3ObjectKey: s3ObjectKey, s3UploadID: initiateOutput.UploadId,
-		parts: make([]obs.Part, 0), md5OfFirst10M: uploadOptPayload.MD5ofPre10M, fileSize: src.Size(),
+		parts: make([]obs.Part, 0), md5OfFirst10M: md5Pre10M, fileSize: src.Size(), // src.Size() is correct here
 	}
 	info := fs.ChunkWriterInfo{ ChunkSize: int64(f.opt.ChunkSize), Concurrency: f.opt.UploadConcurrency }
 	return info, writer, nil
 }
 
-func (lcw *linkboxChunkWriter) WriteChunk(ctx context.Context, partNumber int, reader io.ReadSeeker) (int64, error) {
+
+func (lcw *linkboxChunkWriter) WriteChunk(ctx context.Context, partNumber int, reader io.ReadSeeker) (int64, error) { /* ... same as before ... */
 	size, err := reader.Seek(0, io.SeekEnd); if err != nil { return 0, fmt.Errorf("WriteChunk: seek end: %w", err) }
 	_, err = reader.Seek(0, io.SeekStart); if err != nil { return 0, fmt.Errorf("WriteChunk: seek start: %w", err) }
-	
-	sdkPartNumber := partNumber + 1 // SDK examples use int for PartNumber
-
-	uploadPartInput := &obs.UploadPartInput{}
-	uploadPartInput.Bucket = lcw.s3Auth.Bucket
-	uploadPartInput.Key = lcw.s3ObjectKey
-	uploadPartInput.UploadId = lcw.s3UploadID
-	uploadPartInput.PartNumber = sdkPartNumber 
-	uploadPartInput.Body = reader 
-	// OBS SDK's UploadPartInput has PartSize field when using SourceFile+Offset.
-	// When Body (io.Reader) is used, ContentLength is typically set on HTTP request, not SDK input struct.
-	// If the SDK strictly requires PartSize here even with Body, this needs adjustment.
-	// Based on `obs/client_part.go`'s `UploadPart` method, it does create a `readerWrapper` if `PartSize` is given.
-	// It's safer to provide it if known.
-	uploadPartInput.PartSize = size
-
-
-	fs.Debugf(lcw.srcRemote, "OBS UploadPart: Bucket: %s, Key: %s, UploadID: %s, Part: %d, Size: %d",
-		uploadPartInput.Bucket, uploadPartInput.Key, uploadPartInput.UploadId, uploadPartInput.PartNumber, uploadPartInput.PartSize)
-	
+	sdkPartNumber := partNumber + 1 
+	uploadPartInput := &obs.UploadPartInput{}; uploadPartInput.Bucket = lcw.s3Auth.Bucket; uploadPartInput.Key = lcw.s3ObjectKey
+	uploadPartInput.UploadId = lcw.s3UploadID; uploadPartInput.PartNumber = sdkPartNumber; uploadPartInput.Body = reader; uploadPartInput.PartSize = size 
+	fs.Debugf(lcw.srcRemote, "OBS UploadPart: Bucket: %s, Key: %s, UploadID: %s, Part: %d, Size: %d", uploadPartInput.Bucket, uploadPartInput.Key, uploadPartInput.UploadId, uploadPartInput.PartNumber, uploadPartInput.PartSize)
 	uploadPartOutput, err := lcw.obsClient.UploadPart(uploadPartInput)
 	if err != nil { return 0, fmt.Errorf("WriteChunk: OBS UploadPart %d for %s failed: %w", sdkPartNumber, lcw.srcRemote, err) }
 	if uploadPartOutput.ETag == "" { return 0, fmt.Errorf("WriteChunk: OBS UploadPart %d response missing ETag", sdkPartNumber) }
-
-	lcw.mu.Lock()
-	lcw.parts = append(lcw.parts, obs.Part{PartNumber: uploadPartInput.PartNumber, ETag: uploadPartOutput.ETag})
-	lcw.mu.Unlock()
+	lcw.mu.Lock(); lcw.parts = append(lcw.parts, obs.Part{PartNumber: uploadPartInput.PartNumber, ETag: uploadPartOutput.ETag}); lcw.mu.Unlock()
 	return size, nil
 }
-
-func (lcw *linkboxChunkWriter) Close(ctx context.Context) error {
+func (lcw *linkboxChunkWriter) Close(ctx context.Context) error { /* ... same as before ... */
 	defer func() { fs.Debugf(lcw.srcRemote, "Closing OBS client in chunkWriter.Close"); lcw.obsClient.Close() }()
-
 	sort.Slice(lcw.parts, func(i, j int) bool { return lcw.parts[i].PartNumber < lcw.parts[j].PartNumber })
-	
-	completeInput := &obs.CompleteMultipartUploadInput{}
-	completeInput.Bucket = lcw.s3Auth.Bucket
-	completeInput.Key = lcw.s3ObjectKey
-	completeInput.UploadId = lcw.s3UploadID
-	completeInput.Parts = lcw.parts 
-
-	fs.Debugf(lcw.srcRemote, "OBS CompleteMultipartUpload: Bucket: %s, Key: %s, UploadID: %s, Parts: %d",
-		completeInput.Bucket, completeInput.Key, completeInput.UploadId, len(completeInput.Parts))
-
+	completeInput := &obs.CompleteMultipartUploadInput{}; completeInput.Bucket = lcw.s3Auth.Bucket; completeInput.Key = lcw.s3ObjectKey
+	completeInput.UploadId = lcw.s3UploadID; completeInput.Parts = lcw.parts 
+	fs.Debugf(lcw.srcRemote, "OBS CompleteMultipartUpload: Bucket: %s, Key: %s, UploadID: %s, Parts: %d", completeInput.Bucket, completeInput.Key, completeInput.UploadId, len(completeInput.Parts))
 	_, err := lcw.obsClient.CompleteMultipartUpload(completeInput) 
 	if err != nil { return fmt.Errorf("Close: OBS CompleteMultipartUpload for %s failed: %w", lcw.srcRemote, err) }
-	
 	return lcw.o.completeUploadLinkbox(ctx, lcw.md5OfFirst10M, lcw.fileSize, lcw.srcRemote)
 }
-
-func (lcw *linkboxChunkWriter) Abort(ctx context.Context) error {
+func (lcw *linkboxChunkWriter) Abort(ctx context.Context) error { /* ... same as before ... */
 	defer func() { fs.Debugf(lcw.srcRemote, "Closing OBS client in chunkWriter.Abort"); lcw.obsClient.Close() }()
-
 	fs.Debugf(lcw.srcRemote, "Aborting OBS multipart upload ID: %s for Key: %s", lcw.s3UploadID, lcw.s3ObjectKey)
-	abortInput := &obs.AbortMultipartUploadInput{}
-	abortInput.Bucket = lcw.s3Auth.Bucket
-	abortInput.Key = lcw.s3ObjectKey
+	abortInput := &obs.AbortMultipartUploadInput{}; abortInput.Bucket = lcw.s3Auth.Bucket; abortInput.Key = lcw.s3ObjectKey
 	abortInput.UploadId = lcw.s3UploadID
-
 	_, err := lcw.obsClient.AbortMultipartUpload(abortInput) 
 	if err != nil { return fmt.Errorf("Abort: OBS AbortMultipartUpload for %s failed: %w", lcw.srcRemote, err) }
 	return nil
