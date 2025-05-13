@@ -30,7 +30,6 @@ import (
 	"github.com/rclone/rclone/lib/rest"
 )
 
-// ... (Constants, init, Options, Fs, Object structs remain the same as your last provided version) ...
 const (
 	maxEntitiesPerPage = 1000; minSleep = 200 * time.Millisecond; maxSleep = 2 * time.Second
 	pacerBurst = 1; linkboxAPIURL = "https://www.linkbox.to/api/open/"; teleboxAPIURL = "https://www.telebox.online/api/"
@@ -42,7 +41,7 @@ func init() {
 	fsi := &fs.RegInfo{ Name: "linkbox", Description: "Linkbox", NewFs: NewFs,
 		Options: []fs.Option{
 			{ Name: "token", Help: "Token from https://www.linkbox.to/admin/account (or Telebox)", Sensitive: true, Required:  true, },
-			{ Name: "upload_cutoff", Help: "Cutoff for switching to multipart upload (Note: current implementation forces multipart).", Default: defaultUploadCutoff, Advanced: true, },
+			{ Name: "upload_cutoff", Help: "Cutoff for switching to multipart upload.", Default: defaultUploadCutoff, Advanced: true, },
 			{ Name: "chunk_size", Help: "Chunk size for multipart uploads (min 5 MiB).", Default: defaultChunkSize, Advanced: true, },
 			{ Name: "upload_concurrency", Help: "Concurrency for multipart uploads.", Default: defaultUploadConcurrency, Advanced: true, },
 		},
@@ -56,8 +55,13 @@ type Object struct { fs *Fs; remote string; size int64; modTime time.Time; conte
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	root = strings.Trim(root, "/"); opt := new(Options); err := configstruct.Set(m, opt)
 	if err != nil { return nil, err }
+	if opt.UploadCutoff <= 0 { opt.UploadCutoff = defaultUploadCutoff } 
 	if opt.ChunkSize <= 0 { opt.ChunkSize = defaultChunkSize }
 	if opt.ChunkSize < minChunkSize { fs.Logf(name, "Chunk size %v < S3 min %v. Adjusting to %v.", opt.ChunkSize, minChunkSize, minChunkSize); opt.ChunkSize = minChunkSize }
+	if opt.UploadCutoff < opt.ChunkSize { 
+		fs.Logf(name, "Upload cutoff %v is smaller than chunk size %v. Adjusting upload_cutoff to %v.", opt.UploadCutoff, opt.ChunkSize, opt.ChunkSize)
+		opt.UploadCutoff = opt.ChunkSize 
+	}
 	if opt.UploadConcurrency <= 0 { opt.UploadConcurrency = defaultUploadConcurrency }
 	ci := fs.GetConfig(ctx); baseHttpClient := fshttp.NewClient(ctx)
 	f := &Fs{ name:  name, opt:   *opt, root:  root, ci:    ci, srv:   rest.NewClient(baseHttpClient), pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep))), }
@@ -92,7 +96,7 @@ func (r *FileUploadSessionResponse) GetS3AuthData() FileUploadSessionData { if r
 func getS3Endpoint(s3Auth FileUploadSessionData) (string, error) {
 	if s3Auth.Server == "" || s3Auth.Bucket == "" { return "", fmt.Errorf("missing server or bucket for S3 endpoint") }
 	parsedServerURL, err := url.Parse(s3Auth.Server); if err != nil { return "", fmt.Errorf("parse S3 server URL '%s': %w", s3Auth.Server, err) }
-	s3Host := s3Auth.Bucket + "." + parsedServerURL.Host; return parsedServerURL.Scheme + "://" + s3Host, nil
+	return parsedServerURL.Scheme + "://" + parsedServerURL.Host, nil
 }
 func newObsClientFromAuthData(authData FileUploadSessionData, constructedEndpoint string) (*obs.ObsClient, error) {
 	if constructedEndpoint == "" || authData.AK == "" || authData.SK == "" { return nil, fmt.Errorf("incomplete credentials/endpoint for OBS client") }
@@ -180,33 +184,17 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if err != nil { return nil, fmt.Errorf("Open failed: %w", err) }; return res.Body, nil
 }
 
-// THIS IS THE METHOD THAT WAS MISSING OR MISPLACED
-// completeUploadLinkbox finalizes the upload with Linkbox's folder_upload_file API
-// and updates the object's metadata.
-func (o *Object) completeUploadLinkbox(ctx context.Context, md5OfFirst10M string, size int64, remote string, options ...fs.OpenOption) error {
-	f := o.fs // Use o.fs, as 'o' is the receiver
-	leaf, dirID, err := f.dirCache.FindPath(ctx, remote, true) 
-	if err != nil { return fmt.Errorf("completeUploadLinkbox: FindPath failed for %s: %w", remote, err) }
-
-	opts := &rest.Opts{
-		Method: "GET", RootURL: linkboxAPIURL, Path: "folder_upload_file", Options: options, 
-		Parameters: url.Values{
-			"token":           {f.opt.Token},
-			"fileMd5ofPre10m": {md5OfFirst10M},
-			"fileSize":        {itoa64(size)},
-			"pid":             {dirID},
-			"diyName":         {leaf},
-		},
-	}
+// completeUploadLinkbox (method of *Object)
+func (o *Object) completeUploadLinkbox(ctx context.Context, md5OfFirst10M string, size int64, remote string, options ...fs.OpenOption) error { 
+	f := o.fs 
+	leaf, dirID, err := f.dirCache.FindPath(ctx, remote, true); if err != nil { return fmt.Errorf("completeUploadLinkbox: FindPath failed for %s: %w", remote, err) }
+	opts := &rest.Opts{ Method: "GET", RootURL: linkboxAPIURL, Path: "folder_upload_file", Options: options, Parameters: url.Values{ "token": {f.opt.Token}, "fileMd5ofPre10m": {md5OfFirst10M}, "fileSize": {itoa64(size)}, "pid": {dirID}, "diyName": {leaf}, } }
 	var folderUploadResult response 
-	err = getUnmarshaledLinkboxAPIResponse(ctx, f, opts, &folderUploadResult) // Use f for f.srv, f.pacer
-	if err != nil {
-		return fmt.Errorf("completeUploadLinkbox: folder_upload_file failed for %s: %w (status %d)", remote, err, folderUploadResult.Status)
-	}
-
+	err = getUnmarshaledLinkboxAPIResponse(ctx, f, opts, &folderUploadResult) 
+	if err != nil { return fmt.Errorf("completeUploadLinkbox: folder_upload_file failed for %s: %w (status %d)", remote, err, folderUploadResult.Status) }
 	const maxTries = 10; var sleepTime = 200 * time.Millisecond; var entity *entity
 	for try := 1; try <= maxTries; try++ {
-		entity, err = getEntity(ctx, f, leaf, dirID, f.opt.Token) // Use f
+		entity, err = getEntity(ctx, f, leaf, dirID, f.opt.Token) 
 		if err == nil { break }
 		if err == fs.ErrorObjectNotFound && try < maxTries { 
 			fs.Debugf(o, "completeUploadLinkbox: Reading object %s after upload failed (%s): try %d/%d, retrying in %v", remote, err, try, maxTries, sleepTime)
@@ -214,13 +202,9 @@ func (o *Object) completeUploadLinkbox(ctx context.Context, md5OfFirst10M string
 		}
 		return fmt.Errorf("completeUploadLinkbox: failed to read object metadata after upload for %s: %w", remote, err)
 	}
-	if err != nil { 
-		return fmt.Errorf("completeUploadLinkbox: failed to read object metadata after multiple retries for %s: %w", remote, err) 
-	}
-	o.set(entity) // 'o' is the receiver of this method, so o.set() updates the correct instance
-	return nil
+	if err != nil { return fmt.Errorf("completeUploadLinkbox: failed to read object metadata after multiple retries for %s: %w", remote, err) }
+	o.set(entity); return nil
 }
-
 
 type RcloneLinkboxUploadInfoOption struct { 
 	ObjectToUpdate *Object
@@ -229,14 +213,14 @@ func (opt RcloneLinkboxUploadInfoOption) String() string { return "LinkboxIntern
 func (opt RcloneLinkboxUploadInfoOption) Header() (string, string) { return "", "" }
 func (opt RcloneLinkboxUploadInfoOption) Mandatory() bool { return false }
 
-
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
 	f := o.fs; 
 	if src.Size() == 0 { return fs.ErrorCantUploadEmptyFiles } 
 	
 	fs.Debugf(o, "Update: Forcing multipart for %s (size %s).", o.Remote(), fs.SizeSuffix(src.Size()))
 
-	// Pass the current object 'o' to OpenChunkWriter via options.
+	// Always pass the current object 'o' to OpenChunkWriter via options.
+	// This is essential for linkboxChunkWriter.Close() to call completeUploadLinkbox on the correct object instance.
 	customOpt := RcloneLinkboxUploadInfoOption{ObjectToUpdate: o}
 	
 	finalMultipartOptions := make([]fs.OpenOption, 0, len(options)+1)
@@ -320,37 +304,51 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
         } 
     }
 	if !foundCustomOpt || objectToUpdate == nil {
-		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: RcloneLinkboxUploadInfoOption containing ObjectToUpdate not found for %s. This option is mandatory and should be passed by Object.Update.", remote)
+		// This is the case where rclone core calls OpenChunkWriter directly.
+		// We create a shell object. The Update method on this shell will be called by the Close method of the chunk writer.
+		fs.Debugf(f, "OpenChunkWriter: RcloneLinkboxUploadInfoOption not found for %s. Creating a new shell Object instance for finalization.", remote)
+		objectToUpdate = &Object{fs: f, remote: remote, size: src.Size()} 
 	}
 
 	srcFsObj, ok := src.(fs.Object)
 	if !ok {
-		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: src fs.ObjectInfo for %s cannot be asserted to fs.Object to read content for MD5 calculation", remote)
+		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: src fs.ObjectInfo for %s cannot be type-asserted to fs.Object to read content for MD5 calculation", remote)
 	}
 	
 	srcIn, err := srcFsObj.Open(ctx)
 	if err != nil {
-		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: failed to open source %s to read first 10MB: %w", remote, err)
+		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: failed to open source object %s to read first 10MB: %w", remote, err)
 	}
 	
 	actualSize := src.Size()
-	if actualSize <= 0 && actualSize != -1 { 
-		fs.CheckClose(srcIn, &err)
-		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: invalid or unknown size %d for %s, which is required", actualSize, remote)
+	if actualSize < 0 { 
+		fs.CheckClose(srcIn, &err) 
+		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: source object %s has unknown size (-1), which is required by Linkbox API", remote)
 	}
+    if actualSize == 0 { // Allow 0-byte files to proceed to Telebox API, it might handle it (e.g., status 600)
+        fs.Debugf(f, "OpenChunkWriter: source object %s has size 0. Proceeding to API.", remote)
+    }
 
-	limit := int64(10 * 1024 * 1024)
-	if actualSize > 0 && actualSize < limit { limit = actualSize }
-	first10mBytesRead := make([]byte, int(limit))
-	n, readErr := io.ReadFull(srcIn, first10mBytesRead)
-	fs.CheckClose(srcIn, &err) 
-	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
-		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: failed to read first 10MB from source %s: %w", remote, readErr)
+	md5Pre10M := ""
+	if actualSize > 0 { // Only read and hash if there's content
+		limit := int64(10 * 1024 * 1024)
+		if actualSize > 0 && actualSize < limit { limit = actualSize }
+		first10mBytesRead := make([]byte, int(limit))
+		n, readErr := io.ReadFull(srcIn, first10mBytesRead)
+		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+			fs.CheckClose(srcIn, &err) 
+			return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: failed to read first 10MB from source %s: %w", remote, readErr)
+		}
+		first10mBytesRead = first10mBytesRead[:n]
+		h := md5.Sum(first10mBytesRead)
+		md5Pre10M = fmt.Sprintf("%x", h)
+	} else { // actualSize is 0
+		emptyMd5 := md5.Sum([]byte{})
+		md5Pre10M = fmt.Sprintf("%x", emptyMd5)
 	}
-	first10mBytesRead = first10mBytesRead[:n]
-	h := md5.Sum(first10mBytesRead)
-	md5Pre10M := fmt.Sprintf("%x", h)
-	fs.Debugf(f, "OpenChunkWriter: Calculated md5Pre10M for %s: %s", remote, md5Pre10M)
+	fs.CheckClose(srcIn, &err) 
+	fs.Debugf(f, "OpenChunkWriter: Calculated md5Pre10M for %s: %s (size: %d)", remote, md5Pre10M, actualSize)
+
 
 	vgroup := fmt.Sprintf("%s_%d", md5Pre10M, actualSize)
 	fs.Debugf(f, "OpenChunkWriter: Requesting upload session for %s, vgroup: %s", remote, vgroup)
@@ -359,9 +357,13 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	err = getUnmarshaledTeleboxAPIResponse(ctx, f, sessionOpts, &sessionResp)
 
 	if sessionResp.Status == 600 {
-		fs.Debugf(f, "OpenChunkWriter: Telebox API status 600 for %s (msg: '%s'). This implies file exists.", remote, sessionResp.Message)
-		// If Update() should have handled this. This is an inconsistent state.
-		return fs.ChunkWriterInfo{}, nil, fserrors.FatalError(fmt.Errorf("OpenChunkWriter was called for %s, but API indicates no S3 upload needed (status 600)", remote))
+		fs.Debugf(f, "OpenChunkWriter: Telebox API status 600 for %s (msg: '%s'). File already exists. Returning AlreadyExistsChunkWriter.", remote, sessionResp.Message)
+		return fs.ChunkWriterInfo{ChunkSize: int64(f.opt.ChunkSize), Concurrency: 1}, 
+		       &alreadyExistsChunkWriter{
+				   o:             objectToUpdate, // Use the determined objectToUpdate
+				   md5OfFirst10M: md5Pre10M,
+				   fileSize:      actualSize,
+			   }, nil
 	}
 	if err != nil { return fs.ChunkWriterInfo{}, nil, fmt.Errorf("OpenChunkWriter: get_file_upload_session for %s: %w", remote, err) }
 	
@@ -392,7 +394,26 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	return info, writer, nil
 }
 
-func (lcw *linkboxChunkWriter) WriteChunk(ctx context.Context, partNumber int, reader io.ReadSeeker) (int64, error) {
+// alreadyExistsChunkWriter handles the case where API status 600 ("not need upload") is received.
+type alreadyExistsChunkWriter struct {
+	o             *Object 
+	md5OfFirst10M string
+	fileSize      int64
+}
+func (cw *alreadyExistsChunkWriter) WriteChunk(ctx context.Context, partNumber int, reader io.ReadSeeker) (int64, error) {
+	fs.Debugf(cw.o, "alreadyExistsChunkWriter: WriteChunk called for part %d on %s - doing nothing.", partNumber, cw.o.Remote())
+	size, _ := reader.Seek(0, io.SeekEnd); return size, nil 
+}
+func (cw *alreadyExistsChunkWriter) Close(ctx context.Context) error {
+	fs.Debugf(cw.o, "alreadyExistsChunkWriter: Close called for %s. Finalizing with completeUploadLinkbox.", cw.o.Remote())
+	return cw.o.completeUploadLinkbox(ctx, cw.md5OfFirst10M, cw.fileSize, cw.o.Remote())
+}
+func (cw *alreadyExistsChunkWriter) Abort(ctx context.Context) error {
+	fs.Debugf(cw.o, "alreadyExistsChunkWriter: Abort called for %s - nothing to abort.", cw.o.Remote()); return nil 
+}
+
+
+func (lcw *linkboxChunkWriter) WriteChunk(ctx context.Context, partNumber int, reader io.ReadSeeker) (int64, error) { /* ... same ... */
 	size, err := reader.Seek(0, io.SeekEnd); if err != nil { return 0, fmt.Errorf("WriteChunk: seek end: %w", err) }
 	_, err = reader.Seek(0, io.SeekStart); if err != nil { return 0, fmt.Errorf("WriteChunk: seek start: %w", err) }
 	sdkPartNumber := partNumber + 1 
@@ -405,7 +426,7 @@ func (lcw *linkboxChunkWriter) WriteChunk(ctx context.Context, partNumber int, r
 	lcw.mu.Lock(); lcw.parts = append(lcw.parts, obs.Part{PartNumber: uploadPartInput.PartNumber, ETag: uploadPartOutput.ETag}); lcw.mu.Unlock()
 	return size, nil
 }
-func (lcw *linkboxChunkWriter) Close(ctx context.Context) error {
+func (lcw *linkboxChunkWriter) Close(ctx context.Context) error { /* ... same, uses lcw.o ... */
 	defer func() { fs.Debugf(lcw.srcRemote, "Closing OBS client in chunkWriter.Close"); lcw.obsClient.Close() }()
 	sort.Slice(lcw.parts, func(i, j int) bool { return lcw.parts[i].PartNumber < lcw.parts[j].PartNumber })
 	completeInput := &obs.CompleteMultipartUploadInput{}; completeInput.Bucket = lcw.s3Auth.Bucket; completeInput.Key = lcw.s3ObjectKey
@@ -413,10 +434,9 @@ func (lcw *linkboxChunkWriter) Close(ctx context.Context) error {
 	fs.Debugf(lcw.srcRemote, "OBS CompleteMultipartUpload: Bucket: %s, Key: %s, UploadID: %s, Parts: %d", completeInput.Bucket, completeInput.Key, completeInput.UploadId, len(completeInput.Parts))
 	_, err := lcw.obsClient.CompleteMultipartUpload(completeInput) 
 	if err != nil { return fmt.Errorf("Close: OBS CompleteMultipartUpload for %s failed: %w", lcw.srcRemote, err) }
-	// Call the method on the o *Object instance stored in the chunk writer
 	return lcw.o.completeUploadLinkbox(ctx, lcw.md5OfFirst10M, lcw.fileSize, lcw.srcRemote) 
 }
-func (lcw *linkboxChunkWriter) Abort(ctx context.Context) error {
+func (lcw *linkboxChunkWriter) Abort(ctx context.Context) error { /* ... same ... */
 	defer func() { fs.Debugf(lcw.srcRemote, "Closing OBS client in chunkWriter.Abort"); lcw.obsClient.Close() }()
 	fs.Debugf(lcw.srcRemote, "Aborting OBS multipart upload ID: %s for Key: %s", lcw.s3UploadID, lcw.s3ObjectKey)
 	abortInput := &obs.AbortMultipartUploadInput{}; abortInput.Bucket = lcw.s3Auth.Bucket; abortInput.Key = lcw.s3ObjectKey
@@ -428,7 +448,7 @@ func (lcw *linkboxChunkWriter) Abort(ctx context.Context) error {
 
 var (
 	_ fs.Fs = &Fs{}; _ fs.Purger = &Fs{}; _ fs.DirCacheFlusher = &Fs{}; _ fs.OpenChunkWriter = &Fs{}
-	_ fs.Object = &Object{}; _ fs.ChunkWriter = &linkboxChunkWriter{}
+	_ fs.Object = &Object{}; _ fs.ChunkWriter = &linkboxChunkWriter{}; _ fs.ChunkWriter = &alreadyExistsChunkWriter{} // Add new type
 	_ responser = &response{}; _ responser = &FileUploadSessionResponse{}
 )
 func min(a, b int) int { if a < b { return a }; return b }
